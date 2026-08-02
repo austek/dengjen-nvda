@@ -10,6 +10,7 @@ from contextlib import suppress
 import config
 import languageHandler
 import synthDriverHandler
+import ui
 from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting
 from nvwave import WavePlayer
 from logHandler import log
@@ -442,12 +443,24 @@ class SynthDriver(synthDriverHandler.SynthDriver):
     def _set_voice(self, value):
         if value not in self.availableVoices:
             value = next(iter(self.availableVoices))
+        try:
+            self.tts.voice = self._standard_voice_map[value].key
+        except Exception:
+            log.exception(f"Failed to load voice `{value}`")
+            ui.message(
+                # Translators: reported when NVDA fails to switch to a Sonata
+                # voice, e.g. because the voice's model file is corrupted or
+                # incomplete. The previous voice remains in use.
+                _("Failed to load voice {voice}. Keeping the previous voice.").format(
+                    voice=self.availableVoices[value].displayName
+                )
+            )
+            return
         self.__voice = value
         with suppress(AttributeError):
             del self._availableVariants
         with suppress(AttributeError):
             del self._availableSpeakers
-        self.tts.voice = self._standard_voice_map[value].key
         if value in SonataConfig:
             variant = SonataConfig[value].get("variant", self.variant)
             speaker = SonataConfig[value].get("speaker")
