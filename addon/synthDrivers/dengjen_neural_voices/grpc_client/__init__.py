@@ -64,6 +64,7 @@ from ..helpers import BIN_DIRECTORY, find_free_port, import_bundled_library
 
 with import_bundled_library():
     import grpc
+    import psutil
     from .. import aio
     from .grpc_protos.sonata_grpc_pb2_grpc import sonata_grpcStub
     from .grpc_protos import sonata_grpc_pb2 as msgs
@@ -72,6 +73,7 @@ with import_bundled_library():
 SONATA_GRPC_SERVER_PORT = None
 GRPC_SERVER_PROCESS = None
 CHANNEL = None
+CHANNEL_PORT = None
 SONATA_GRPC_SERVICE = None
 SERVER_CHECK_TIMEOUT = 15
 # Outer bound on the startup futures; must exceed SERVER_CHECK_TIMEOUT so the
@@ -79,14 +81,79 @@ SERVER_CHECK_TIMEOUT = 15
 STARTUP_TIMEOUT = SERVER_CHECK_TIMEOUT + 5
 CALL_TIMEOUT = 10
 CHANNEL_CLOSE_TIMEOUT = 5
+PROCESS_EXIT_TIMEOUT = 3
+
+
+def _clear_saved_server_state():
+    for name in ("SONATA_GRPC_SERVER_PORT", "GRPC_SERVER_PROCESS"):
+        if hasattr(globalVars, name):
+            delattr(globalVars, name)
+
+
+def _reap_stale_grpc_servers(grpc_server_exe):
+    """Stop helpers whose parent no longer owns them, including failed local shutdowns."""
+    try:
+        expected_exe = os.path.normcase(os.path.realpath(grpc_server_exe))
+        expected_name = os.path.normcase(os.path.basename(expected_exe))
+        stale_processes = []
+        for proc in psutil.process_iter(attrs=["pid", "name", "exe"]):
+            try:
+                process_name = proc.info.get("name") or ""
+                if os.path.normcase(process_name) != expected_name:
+                    continue
+                process_exe = proc.info.get("exe")
+                if not process_exe:
+                    continue
+                if os.path.normcase(os.path.realpath(process_exe)) != expected_exe:
+                    continue
+                # DETACHED_PROCESS does not sever the Windows parent relationship.
+                # start_grpc_server() has already reused this NVDA session's saved
+                # live helper before reaching the reaper. A same-path helper whose
+                # parent is this NVDA is therefore stale after a failed local
+                # shutdown; one owned by another live process must be preserved.
+                parent = proc.parent()
+                if parent is not None and parent.pid != os.getpid():
+                    continue
+                proc.terminate()
+                stale_processes.append(proc)
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                log.debug("Could not inspect or terminate a Dengjen GRPC helper", exc_info=True)
+        if not stale_processes:
+            return
+        _, alive = psutil.wait_procs(stale_processes, timeout=PROCESS_EXIT_TIMEOUT)
+        removed_count = len(stale_processes) - len(alive)
+        if removed_count:
+            log.info(f"Removed {removed_count} abandoned Dengjen GRPC helper process(es)")
+        if alive:
+            # On Windows, terminate() and kill() both call TerminateProcess. A
+            # second attempt cannot improve the result, so report and continue.
+            log.warning(
+                f"Could not remove {len(alive)} abandoned Dengjen GRPC helper process(es)"
+            )
+    except Exception:
+        # Reaping is recovery for a previous failed shutdown. It must never make
+        # the synthesizer unavailable in an otherwise healthy NVDA session.
+        log.exception("Failed while checking for abandoned Dengjen GRPC helpers")
 
 
 def start_grpc_server():
     global GRPC_SERVER_PROCESS, SONATA_GRPC_SERVER_PORT
     if hasattr(globalVars, "SONATA_GRPC_SERVER_PORT"):
-        SONATA_GRPC_SERVER_PORT = globalVars.SONATA_GRPC_SERVER_PORT
-        GRPC_SERVER_PROCESS = globalVars.GRPC_SERVER_PROCESS
-        return True
+        saved_process = getattr(globalVars, "GRPC_SERVER_PROCESS", None)
+        try:
+            saved_process_is_alive = (
+                saved_process is not None and saved_process.poll() is None
+            )
+        except OSError:
+            saved_process_is_alive = False
+            log.debug("Could not inspect the saved Dengjen GRPC helper", exc_info=True)
+        if saved_process_is_alive:
+            SONATA_GRPC_SERVER_PORT = globalVars.SONATA_GRPC_SERVER_PORT
+            GRPC_SERVER_PROCESS = saved_process
+            return True
+        _clear_saved_server_state()
+    grpc_server_exe = os.path.join(BIN_DIRECTORY, "sonata-grpc.exe")
+    _reap_stale_grpc_servers(grpc_server_exe)
     if _vcruntime_missing():
         log.error(
             "Dengjen GRPC server cannot start: vcruntime140_1.dll not found. "
@@ -96,7 +163,6 @@ def start_grpc_server():
         _show_vcruntime_warning()
         return False
     SONATA_GRPC_SERVER_PORT = find_free_port()
-    grpc_server_exe = os.path.join(BIN_DIRECTORY, "sonata-grpc.exe")
     nvda_espeak_dir = os.path.join(globalVars.appDir, "synthDrivers")
     env = os.environ.copy()
     env.update({
@@ -138,14 +204,21 @@ def start_grpc_server():
 
 @aio.asyncio_coroutine_to_concurrent_future
 async def initialize():
-    global CHANNEL, SONATA_GRPC_SERVICE, SONATA_GRPC_SERVER_PORT
-    start_grpc_server()
+    global CHANNEL, CHANNEL_PORT, SONATA_GRPC_SERVICE, SONATA_GRPC_SERVER_PORT
+    if not start_grpc_server():
+        raise RuntimeError("Dengjen GRPC server could not be started")
+    port = SONATA_GRPC_SERVER_PORT
     if CHANNEL is not None:
         try:
             # grpc.aio binds a channel to the loop that created it, so a channel
-            # outliving its loop has to be replaced rather than reused.
+            # outliving its loop has to be replaced rather than reused. A new
+            # helper also receives a new port, which invalidates the old channel.
             channel_loop = getattr(CHANNEL, "_loop", None)
-            if channel_loop is aio.ENGINE.event_loop and aio.ENGINE.event_loop.is_running():
+            if (
+                channel_loop is aio.ENGINE.event_loop
+                and aio.ENGINE.event_loop.is_running()
+                and CHANNEL_PORT == port
+            ):
                 return
         except Exception:
             log.debug("Failed to inspect the existing GRPC channel", exc_info=True)
@@ -154,8 +227,10 @@ async def initialize():
         except Exception:
             log.debug("Failed to close the stale GRPC channel", exc_info=True)
         CHANNEL = None
-    port = SONATA_GRPC_SERVER_PORT
+        CHANNEL_PORT = None
+        SONATA_GRPC_SERVICE = None
     CHANNEL = grpc.aio.insecure_channel(f"localhost:{port}")
+    CHANNEL_PORT = port
     SONATA_GRPC_SERVICE = sonata_grpcStub(CHANNEL)
 
 
@@ -165,10 +240,14 @@ def close_channel():
     Channel.close() is a coroutine whose internals walk the running loop's
     task set, so it cannot be driven from another thread or a stopped loop.
     """
-    global CHANNEL
+    global CHANNEL, CHANNEL_PORT, SONATA_GRPC_SERVICE
     if CHANNEL is None:
+        CHANNEL_PORT = None
+        SONATA_GRPC_SERVICE = None
         return
     channel, CHANNEL = CHANNEL, None
+    CHANNEL_PORT = None
+    SONATA_GRPC_SERVICE = None
     loop = aio.ENGINE.event_loop
     if loop is None or not loop.is_running():
         log.debug("Discarding the GRPC channel: its event loop is gone")
@@ -186,11 +265,31 @@ def close_channel():
 def terminate():
     global GRPC_SERVER_PROCESS, SONATA_GRPC_SERVER_PORT
     SONATA_GRPC_SERVER_PORT = None
-    close_channel()
-    aio.terminate()
-    if GRPC_SERVER_PROCESS is not None:
-        GRPC_SERVER_PROCESS.terminate()
-        GRPC_SERVER_PROCESS = None
+    try:
+        close_channel()
+    except Exception:
+        log.exception("Failed to close the Dengjen GRPC channel during shutdown")
+    try:
+        aio.terminate()
+    except Exception:
+        log.exception("Failed to stop the Dengjen asynchronous engine during shutdown")
+    process, GRPC_SERVER_PROCESS = GRPC_SERVER_PROCESS, None
+    try:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=PROCESS_EXIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # On Windows, Popen.kill() is the same TerminateProcess call as
+            # terminate(), so retrying would only add another timeout delay.
+            log.warning("Dengjen GRPC helper did not exit during shutdown")
+        except OSError:
+            log.debug("Dengjen GRPC helper was already unavailable during shutdown", exc_info=True)
+    except Exception:
+        log.exception("Failed to stop the Dengjen GRPC helper during shutdown")
+    finally:
+        _clear_saved_server_state()
 
 
 @aio.asyncio_coroutine_to_concurrent_future
